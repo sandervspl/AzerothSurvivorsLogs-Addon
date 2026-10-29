@@ -1,0 +1,9 @@
+## Interface: 11200
+## Title: Azeroth Survivors Recorder
+## Notes: Records run state and observed spell and jewelry progression for Azeroth Survivors Logs.
+## Author: sandervspl
+## Version: 0.1.6
+## SavedVariables: AZSRecorderDB
+SpellTooltips.lua
+Jewelry.lua
+AzerothSurvivorsRecorder.lua
