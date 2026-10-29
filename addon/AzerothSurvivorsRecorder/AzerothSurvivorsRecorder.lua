@@ -1,5 +1,5 @@
 -- WoW 1.12 / Lua 5.0 conventions. This addon never changes gameplay or HUD settings.
-local VERSION = "0.1.6"
+local VERSION = "0.1.7"
 local MAX_RUNS, MAX_EVENTS = 8, 24000
 local frame = CreateFrame("Frame")
 local current, previousPhase, spellState, lastSample, pendingZone, awaitingRun
@@ -71,6 +71,42 @@ local function Emit(kind, data)
     end
     if kind == "jewelry" then current.jewelryCount = (current.jewelryCount or 0) + 1 end
     return current.sequence
+end
+
+-- Count observations are evidence of other players, not proof of lifetime solo mode.
+local partyState, lastPartySample
+local function PartyCount(fn)
+    if type(fn) ~= "function" then return nil end
+    local ok, n = pcall(fn)
+    if ok and type(n) == "number" and n >= 0 and n <= 40 and math.floor(n) == n then return n end
+end
+local function ObserveParty(reason, freshMeter)
+    if not current then return end
+    local data = { source = "client-party-apis", partyMembers = PartyCount(GetNumPartyMembers),
+        raidMembers = PartyCount(GetNumRaidMembers) }
+    -- AZS_PARTY can retain the previous run. Only capture it on a fresh transport update.
+    if freshMeter then data.meter = AZS_PARTY or {}; data.source = "AZSPARTY" end
+    local encoded = Json(data)
+    if reason == "baseline" or freshMeter or encoded ~= partyState then
+        partyState = encoded
+        data.reason = reason
+        Emit("party_observation", data)
+    end
+end
+local function ObserveClientVersion()
+    local data = { source = "GetBuildInfo", namespace = "base-wow", status = "unsupported" }
+    if type(GetBuildInfo) == "function" then
+        local ok, version, build, date, interface = pcall(GetBuildInfo)
+        data.status = ok and "observed" or "error"
+        if ok then
+            -- The inspected client returns stock WoW constants here, not its AZS build.
+            if type(version) == "string" then data.version = version end
+            if type(build) == "string" or type(build) == "number" then data.build = build end
+            if type(date) == "string" then data.date = date end
+            if type(interface) == "number" then data.interface = interface end
+        end
+    end
+    Emit("client_version", data)
 end
 
 local function ObserveSpells(baseline)
@@ -182,6 +218,9 @@ local function StartRun()
     AZSRecorderJewelry.Reset()
     noticeCount = 0
     Emit("run_start", { zone = AZS_ZONE or {}, partial = current.partial, recorderVersion = VERSION })
+    ObserveClientVersion()
+    partyState, lastPartySample = nil, GetTime()
+    ObserveParty("baseline", false)
     ObserveSpells(true)
     playerSpellState, lastPlayerSpellSample = nil, nil
     ObservePlayerSpells(true)
@@ -225,6 +264,8 @@ frame:RegisterEvent("ACTIONBAR_SLOT_CHANGED")
 frame:RegisterEvent("UNIT_INVENTORY_CHANGED")
 frame:RegisterEvent("BAG_UPDATE")
 frame:RegisterEvent("BAG_UPDATE_COOLDOWN")
+frame:RegisterEvent("PARTY_MEMBERS_CHANGED")
+frame:RegisterEvent("RAID_ROSTER_UPDATE")
 frame:SetScript("OnEvent", function()
     Init()
     if event == "CHAT_MSG_ADDON" then
@@ -237,6 +278,7 @@ frame:SetScript("OnEvent", function()
         if prefix == "AZSRUN" then awaitingRun = false end
         Poll()
         if not current then return end
+        if prefix == "AZSPARTY" then ObserveParty("transport", true) end
         if prefix == "AZSSPELLS" then ObserveSpells(false)
         elseif prefix == "AZSPETS" then Emit("pets", { summons = AZS_PETS or {} })
         elseif prefix == "AZS" then Emit("stats", AZS_STATS or {})
@@ -249,6 +291,8 @@ frame:SetScript("OnEvent", function()
         if prefix == "AZS" or prefix == "AZSBUFFS" then AZSRecorderJewelry.Request("bonuses", current.sequence) end
         AZSRecorderTooltips.Update(Emit)
         AZSRecorderJewelry.Update(Emit)
+    elseif event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
+        ObserveParty(event, false)
     elseif event == "ACTIONBAR_SLOT_CHANGED" then
         if current then AZSRecorderTooltips.Request("actionbar", current.sequence) end
     elseif event == "CHAT_MSG_LOOT" then
@@ -275,6 +319,10 @@ frame:SetScript("OnUpdate", function()
     if elapsed < 0.2 then return end
     elapsed = 0
     Poll()
+    if current and (not lastPartySample or GetTime() - lastPartySample >= 1) then
+        lastPartySample = GetTime()
+        ObserveParty("poll", false)
+    end
     if current then ObservePlayerSpells(false) end
     if current then AZSRecorderTooltips.Update(Emit) end
     if current then AZSRecorderJewelry.Update(Emit) end

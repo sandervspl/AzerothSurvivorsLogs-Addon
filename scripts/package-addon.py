@@ -21,8 +21,12 @@ with zipfile.ZipFile(package, 'w', compression=zipfile.ZIP_DEFLATED) as archive:
 with zipfile.ZipFile(package) as archive:
     assert sorted(archive.namelist()) == sorted(name + '/' + f for f in files)
     assert archive.testzip() is None
+    runtime_files = {}
     for filename in files:
-        assert archive.read(name + '/' + filename) == (source / filename).read_bytes()
+        data = archive.read(name + '/' + filename)
+        assert data == (source / filename).read_bytes()
+        runtime_files[filename] = {'sha256': hashlib.sha256(data).hexdigest(), 'size': len(data)}
 result = {'package':str(package), 'sha256':hashlib.sha256(package.read_bytes()).hexdigest(), 'files':files, 'verified':True}
+result['runtimeFiles'] = runtime_files
 (out / 'addon-package.json').write_text(json.dumps(result, indent=2), encoding='utf-8')
 print(json.dumps(result))
