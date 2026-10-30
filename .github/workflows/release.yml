@@ -24,4 +24,5 @@ jobs:
           [[ "$TAG" =~ ^addon-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
           version=$(sed -n 's/^## Version: //p' addon/AzerothSurvivorsRecorder/AzerothSurvivorsRecorder.toc | tr -d '\r')
           test "$TAG" = "addon-v$version"
-          gh release create "$TAG" artifacts/*.zip --target "$GITHUB_SHA" --draft --title "$TAG" --notes "Source monorepo commit: $(cat SOURCE_COMMIT)"
+          test -s "release-notes/addon/$TAG.md"
+          gh release create "$TAG" artifacts/*.zip --target "$GITHUB_SHA" --draft --title "$TAG" --notes-file "release-notes/addon/$TAG.md"
