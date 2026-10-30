@@ -4,6 +4,16 @@ local J = AZSRecorderJewelry
 local slots = { "Finger0Slot", "Finger1Slot", "NeckSlot", "Trinket0Slot", "Trinket1Slot" }
 local NAME = "AZSRecorderJewelryScan"
 local tip, signatures, pending, nextCheck, count, capped
+local TEXT_PREFIXES = { NAME .. "TextLeft", NAME .. "TextRight" }
+local TEXT_KEYS = { "left", "right" }
+local SIGNATURE_FIELDS = { "status", "slot", "link", "icon", "quality", "truncated" }
+local COLOR_FIELDS = { "leftColor", "rightColor" }
+local RETRY_DELAYS = { 0, 0.4, 1.2 }
+local PERIODIC_REQUEST = { reason = "periodic", pass = 1 }
+
+local function HideTip()
+    if tip then tip:Hide() end
+end
 
 local function Lines(slot, equipment)
     if not tip then tip = CreateFrame("GameTooltip", NAME, UIParent, "GameTooltipTemplate") end
@@ -17,14 +27,14 @@ local function Lines(slot, equipment)
     if n > limit then n = limit; clipped = true end
     for i = 1, n do
         local row = {}
-        for _, side in ipairs({ "Left", "Right" }) do
-            local fs = getglobal(NAME .. "Text" .. side .. i)
+        for side = 1, 2 do
+            local fs = getglobal(TEXT_PREFIXES[side] .. i)
             local text = fs and fs:GetText()
             if type(text) == "string" then
                 if string.len(text) > 4000 or bytes + string.len(text) > byteLimit then
                     clipped = true
                 else
-                    local key = string.lower(side)
+                    local key = TEXT_KEYS[side]
                     row[key] = text
                     bytes = bytes + string.len(text)
                     if fs.GetTextColor then
@@ -71,17 +81,18 @@ local function Read(key, equipment)
     return data
 end
 
+local function Add(parts, value)
+    local text = tostring(value)
+    table.insert(parts, tostring(string.len(text)) .. ":" .. text)
+end
+
 local function Signature(data)
     local parts = {}
-    local function Add(value)
-        local text = tostring(value)
-        table.insert(parts, tostring(string.len(text)) .. ":" .. text)
-    end
-    for _, field in ipairs({ "status", "slot", "link", "icon", "quality", "truncated" }) do Add(data[field]) end
+    for _, field in ipairs(SIGNATURE_FIELDS) do Add(parts, data[field]) end
     for _, row in ipairs(data.lines) do
-        Add(row.left); Add(row.right)
-        for _, color in ipairs({ "leftColor", "rightColor" }) do
-            for i = 1, 4 do Add(row[color] and row[color][i]) end
+        Add(parts, row.left); Add(parts, row.right)
+        for _, color in ipairs(COLOR_FIELDS) do
+            for i = 1, 4 do Add(parts, row[color] and row[color][i]) end
         end
     end
     return table.concat(parts)
@@ -99,7 +110,7 @@ end
 local function Capture(emit, reason, sequence, attempt)
     for _, key in ipairs(slots) do
         local ok, data = pcall(Read, key)
-        if tip then pcall(function() tip:Hide() end) end
+        if tip then pcall(HideTip) end
         if not ok then data = { slotKey = key, status = "unavailable", lines = {} } end
         local signature = Signature(data)
         if signature ~= signatures[key] then
@@ -124,7 +135,7 @@ function J.Update(emit)
     if capped then return end
     local now = GetTime()
     if pending then
-        local delay = ({ 0, 0.4, 1.2 })[pending.pass]
+        local delay = RETRY_DELAYS[pending.pass]
         if now - pending.at >= delay then
             Capture(emit, pending.reason, pending.sequence, pending.pass)
             pending.pass = pending.pass + 1
@@ -157,12 +168,12 @@ function E.Update(emit)
     if gearCapped then return end
     local now = GetTime()
     if gearPending then
-        if now - gearPending.at < ({ 0, 0.4, 1.2 })[gearPending.pass] then return end
+        if now - gearPending.at < RETRY_DELAYS[gearPending.pass] then return end
     elseif now < gearNext then return end
-    local request = gearPending or { reason = "periodic", pass = 1 }
+    local request = gearPending or PERIODIC_REQUEST
     for _, key in ipairs(equipmentSlots) do
         local ok, data = pcall(Read, key, true)
-        if tip then pcall(function() tip:Hide() end) end
+        if tip then pcall(HideTip) end
         if not ok then data = { slotKey = key, status = "unavailable", lines = {} } end
         local signature = Signature(data)
         if signature ~= gearSignatures[key] then

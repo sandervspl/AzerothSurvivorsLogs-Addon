@@ -3,6 +3,9 @@ AZSRecorderTooltips = {}
 local T = AZSRecorderTooltips
 local tip, pending, signatures, count, nextCheck, capped
 local NAME = "AZSRecorderSpellScan"
+local TEXT_PREFIXES = { NAME .. "TextLeft", NAME .. "TextRight" }
+local TEXT_KEYS = { "left", "right" }
+local RETRY_DELAYS = { 0, 0.4, 1.2 }
 
 local function Plain(text)
     text = string.gsub(text or "", "|c%x%x%x%x%x%x%x%x", "")
@@ -15,21 +18,29 @@ local function Scanner()
     return tip
 end
 
-local function ReadLines(scan)
+local function HideTip()
+    if tip then tip:Hide() end
+end
+
+local function ReadLines(scan, n, firstText, firstFont)
     local lines, clipped, bytes = {}, false, 0
-    local n = scan:NumLines() or 0
     if n > 32 then clipped = true; n = 32 end
     for i = 1, n do
         local row = {}
-        for _, side in ipairs({ "Left", "Right" }) do
-            local fs = getglobal(NAME .. "Text" .. side .. i)
-            local text = fs and fs:GetText()
+        for side = 1, 2 do
+            local fs, text
+            if i == 1 and side == 1 then
+                fs, text = firstFont, firstText
+            else
+                fs = getglobal(TEXT_PREFIXES[side] .. i)
+                text = fs and fs:GetText()
+            end
             if type(text) == "string" then
                 -- Do not cut through UTF-8. Omit an oversized side and flag the gap.
                 if string.len(text) > 4000 or bytes + string.len(text) > 8000 then
                     clipped = true
                 else
-                    local key = string.lower(side)
+                    local key = TEXT_KEYS[side]
                     row[key] = text
                     bytes = bytes + string.len(text)
                     if fs.GetTextColor then
@@ -44,14 +55,39 @@ local function ReadLines(scan)
     return lines, clipped
 end
 
-local function Read(method, value)
+local function Prepare(method, value)
     local scan = Scanner()
     scan:SetOwner(UIParent, "ANCHOR_NONE")
     scan:ClearLines()
     scan[method](scan, value)
-    local lines, clipped = ReadLines(scan)
+    return scan
+end
+
+local function Title(scan)
+    local n = scan:NumLines() or 0
+    local fs = n >= 1 and getglobal(TEXT_PREFIXES[1] .. "1")
+    local text = fs and fs:GetText()
+    -- Apply the same first-side limit as the full row reader.
+    if type(text) ~= "string" or string.len(text) > 4000 then return nil, fs, n end
+    return text, fs, n
+end
+
+local function ReadName(spell)
+    local scan = Prepare("SetHyperlink", "enchant:" .. tostring(spell))
+    local title = Title(scan)
     scan:Hide()
-    return lines, clipped
+    if title then return Plain(title) end
+end
+
+local function ReadAction(slot, wanted)
+    local scan = Prepare("SetAction", slot)
+    local title, fs, n = Title(scan)
+    local name = title and Plain(title)
+    if not name or not wanted[name] then scan:Hide(); return end
+    -- Copy complete matching rows before Hide clears native ownership/text.
+    local lines, clipped = ReadLines(scan, n, title, fs)
+    scan:Hide()
+    return lines, clipped, name
 end
 
 local function Signature(data)
@@ -79,33 +115,32 @@ end
 
 local function Capture(emit, reason, sequence, attempt)
     local spells, names, byName, actions = AZS_SPELLS or {}, {}, {}, {}
+    local hasNames = false
     local available = type(HasAction) == "function" and type(getglobal) == "function"
     for _, s in ipairs(spells) do
         if s.key and s.spell and available then
-            local ok, lines = pcall(Read, "SetHyperlink", "enchant:" .. tostring(s.spell))
-            local name = ok and lines[1] and Plain(lines[1].left)
+            local ok, name = pcall(ReadName, s.spell)
+            if not ok then name = nil end
             if name and name ~= "" then
+                hasNames = true
                 names[s.key] = name
                 byName[name] = (byName[name] or 0) + 1
             end
         end
     end
-    if available then
+    if available and hasNames then
         for slot = 1, 120 do
             local ok, has = pcall(HasAction, slot)
             if ok and has then
-                local read, lines, clipped = pcall(Read, "SetAction", slot)
-                if read and lines[1] then
-                    local name = Plain(lines[1].left)
-                    if byName[name] then
-                        actions[name] = actions[name] or {}
-                        table.insert(actions[name], { slot = slot, lines = lines, truncated = clipped })
-                    end
+                local read, lines, clipped, name = pcall(ReadAction, slot, byName)
+                if read and lines then
+                    actions[name] = actions[name] or {}
+                    table.insert(actions[name], { slot = slot, lines = lines, truncated = clipped })
                 end
             end
         end
     end
-    if tip then pcall(function() tip:Hide() end) end
+    if tip then pcall(HideTip) end
     for _, s in ipairs(spells) do
         if s.key and s.spell and s.rank then
             local name = names[s.key]
@@ -144,7 +179,7 @@ function T.Update(emit)
     if capped then return end
     local now = GetTime()
     if pending then
-        local delay = ({ 0, 0.4, 1.2 })[pending.pass]
+        local delay = RETRY_DELAYS[pending.pass]
         if now - pending.at >= delay then
             Capture(emit, pending.reason, pending.sequence, pending.pass)
             pending.pass = pending.pass + 1

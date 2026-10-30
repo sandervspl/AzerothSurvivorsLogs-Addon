@@ -1,5 +1,5 @@
 -- WoW 1.12 / Lua 5.0 conventions. This addon never changes gameplay or HUD settings.
-local VERSION = "0.1.8"
+local VERSION = "0.1.9"
 local MAX_RUNS, MAX_EVENTS = 8, 24000
 local frame = CreateFrame("Frame")
 local current, previousPhase, spellState, lastSample, pendingZone, awaitingRun
@@ -115,7 +115,11 @@ local function ObserveSpells(baseline)
     for _, s in ipairs(AZS_SPELLS or {}) do
         if s.key then
             local old = spellState[s.key]
-            nextState[s.key] = { spell = s.spell, rank = s.rank }
+            if old and old.spell == s.spell and old.rank == s.rank then
+                nextState[s.key] = old
+            else
+                nextState[s.key] = { spell = s.spell, rank = s.rank }
+            end
             if baseline or not old or old.spell ~= s.spell or old.rank ~= s.rank then
                 changed = true
                 Emit(baseline and "spell_baseline" or (old and "spell_changed" or "spell_acquired"), {
@@ -140,7 +144,39 @@ local function ObserveSpells(baseline)
 end
 
 -- Stock talent-API tuples expose learned player passives, not native AZS allocations.
-local playerSpellState, lastPlayerSpellSample
+local playerSpellState, playerSpellSnapshot, lastPlayerSpellSample
+local TALENT_FIELDS = { "index", "name", "icon", "tier", "column", "rank", "maxRank" }
+
+local function SameTalentValue(a, b)
+    local kind = type(a)
+    if kind ~= type(b) then return false end
+    if kind == "number" then
+        -- NaN and unusual number representations fall back to the JSON comparison.
+        return a == b and (a ~= 0 or tostring(a) == tostring(b))
+    end
+    if kind == "string" or kind == "boolean" or kind == "nil" then return a == b end
+    -- Unexpected native tables can be mutated in place. Never trust their identity.
+    return false
+end
+
+local function SamePlayerSpells(a, b)
+    if not b or a.status ~= b.status or a.tabCount ~= b.tabCount then return false end
+    if a.status ~= "complete" then return true end
+    if table.getn(a.tabs) ~= table.getn(b.tabs) then return false end
+    for tab, data in ipairs(a.tabs) do
+        local old = b.tabs[tab]
+        if data.index ~= old.index or table.getn(data.talents) ~= table.getn(old.talents) then return false end
+        for index, talent in ipairs(data.talents) do
+            if talent ~= old.talents[index] then
+                for _, field in ipairs(TALENT_FIELDS) do
+                    if not SameTalentValue(talent[field], old.talents[index][field]) then return false end
+                end
+            end
+        end
+    end
+    return true
+end
+
 local function ReadPlayerSpells()
     if type(GetNumTalentTabs) ~= "function" or type(GetNumTalents) ~= "function"
         or type(GetTalentInfo) ~= "function" then
@@ -157,14 +193,25 @@ local function ReadPlayerSpells()
             return { status = "unavailable" }
         end
         local talents = {}
+        local previous = playerSpellSnapshot and playerSpellSnapshot.status == "complete"
+            and playerSpellSnapshot.tabs[tab]
         for index = 1, n do
             local name, icon, tier, column, rank, maxRank = GetTalentInfo(tab, index)
             if type(name) ~= "string" or name == "" or type(rank) ~= "number"
                 or type(maxRank) ~= "number" or rank < 0 or maxRank < 1 or rank > maxRank then
                 return { status = "unavailable" }
             end
-            table.insert(talents, { index = index, name = name, icon = icon,
-                tier = tier, column = column, rank = rank, maxRank = maxRank })
+            local old = previous and previous.talents[index]
+            -- These scalar-only rows are private and immutable after observation.
+            if old and old.index == index and old.name == name
+                and SameTalentValue(old.icon, icon) and SameTalentValue(old.tier, tier)
+                and SameTalentValue(old.column, column) and SameTalentValue(old.rank, rank)
+                and SameTalentValue(old.maxRank, maxRank) then
+                talents[index] = old
+            else
+                talents[index] = { index = index, name = name, icon = icon,
+                    tier = tier, column = column, rank = rank, maxRank = maxRank }
+            end
         end
         table.insert(tabs, { index = tab, talents = talents })
     end
@@ -177,7 +224,9 @@ local function ObservePlayerSpells(baseline)
     lastPlayerSpellSample = now
     local ok, data = pcall(ReadPlayerSpells)
     if not ok then data = { status = "error" } end
+    if not baseline and SamePlayerSpells(data, playerSpellSnapshot) then return end
     local encoded = Json(data)
+    playerSpellSnapshot = data
     if baseline or encoded ~= playerSpellState then
         playerSpellState = encoded
         data.reason = baseline and "baseline" or "observed_change"
@@ -223,7 +272,7 @@ local function StartRun()
     partyState, lastPartySample = nil, GetTime()
     ObserveParty("baseline", false)
     ObserveSpells(true)
-    playerSpellState, lastPlayerSpellSample = nil, nil
+    playerSpellState, playerSpellSnapshot, lastPlayerSpellSample = nil, nil, nil
     ObservePlayerSpells(true)
     Emit("stats", AZS_STATS or {})
     Emit("pets", { summons = AZS_PETS or {} })
