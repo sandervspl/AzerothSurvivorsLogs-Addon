@@ -1,5 +1,5 @@
 -- WoW 1.12 / Lua 5.0 conventions. This addon never changes gameplay or HUD settings.
-local VERSION = "0.1.9"
+local VERSION = "0.1.10"
 local MAX_RUNS, MAX_EVENTS = 8, 24000
 local frame = CreateFrame("Frame")
 local current, previousPhase, spellState, lastSample, pendingZone, awaitingRun
