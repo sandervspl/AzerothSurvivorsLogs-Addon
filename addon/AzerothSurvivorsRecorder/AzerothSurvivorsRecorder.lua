@@ -1,5 +1,5 @@
 -- WoW 1.12 / Lua 5.0 conventions. This addon never changes gameplay or HUD settings.
-local VERSION = "0.1.7"
+local VERSION = "0.1.8"
 local MAX_RUNS, MAX_EVENTS = 8, 24000
 local frame = CreateFrame("Frame")
 local current, previousPhase, spellState, lastSample, pendingZone, awaitingRun
@@ -216,6 +216,7 @@ local function StartRun()
     spellState, lastSample = {}, nil
     AZSRecorderTooltips.Reset()
     AZSRecorderJewelry.Reset()
+    AZSRecorderEquipment.Reset()
     noticeCount = 0
     Emit("run_start", { zone = AZS_ZONE or {}, partial = current.partial, recorderVersion = VERSION })
     ObserveClientVersion()
@@ -226,7 +227,7 @@ local function StartRun()
     ObservePlayerSpells(true)
     Emit("stats", AZS_STATS or {})
     Emit("pets", { summons = AZS_PETS or {} })
-    AZSRecorderJewelry.Request("baseline", current.sequence)
+    AZSRecorderJewelry.Request("baseline", current.sequence); AZSRecorderEquipment.Request("baseline", current.sequence)
     pendingZone = false
 end
 
@@ -241,7 +242,7 @@ local function Poll()
         Emit("phase", { phase = phase or "unknown", previous = previousPhase })
         previousPhase = phase
         AZSRecorderTooltips.Request("phase", current.sequence)
-        AZSRecorderJewelry.Request("phase", current.sequence)
+        AZSRecorderJewelry.Request("phase", current.sequence); AZSRecorderEquipment.Request("phase", current.sequence)
     end
     local clock = Clock()
     if clock and clock ~= lastSample and (not lastSample or math.abs(clock - lastSample) >= 1) then
@@ -288,9 +289,9 @@ frame:SetScript("OnEvent", function()
         elseif prefix == "AZSBOSSES" then Emit("bosses", AZS_SCHEDULE or {})
         end
         if prefix == "AZS" or prefix == "AZSBUFFS" then AZSRecorderTooltips.Request("bonuses", current.sequence) end
-        if prefix == "AZS" or prefix == "AZSBUFFS" then AZSRecorderJewelry.Request("bonuses", current.sequence) end
+        if prefix == "AZS" or prefix == "AZSBUFFS" then AZSRecorderJewelry.Request("bonuses", current.sequence); AZSRecorderEquipment.Request("bonuses", current.sequence) end
         AZSRecorderTooltips.Update(Emit)
-        AZSRecorderJewelry.Update(Emit)
+        AZSRecorderJewelry.Update(Emit); AZSRecorderEquipment.Update(Emit)
     elseif event == "PARTY_MEMBERS_CHANGED" or event == "RAID_ROSTER_UPDATE" then
         ObserveParty(event, false)
     elseif event == "ACTIONBAR_SLOT_CHANGED" then
@@ -302,11 +303,11 @@ frame:SetScript("OnEvent", function()
         Notice(event, arg1)
     elseif event == "UNIT_INVENTORY_CHANGED" then
         if current and arg1 == "player" then
-            AZSRecorderJewelry.Request("inventory", current.sequence)
-            AZSRecorderJewelry.Update(Emit)
+            AZSRecorderJewelry.Request("inventory", current.sequence); AZSRecorderEquipment.Request("inventory", current.sequence)
+            AZSRecorderJewelry.Update(Emit); AZSRecorderEquipment.Update(Emit)
         end
     elseif event == "BAG_UPDATE" or event == "BAG_UPDATE_COOLDOWN" then
-        if current then AZSRecorderJewelry.Request("bags", current.sequence) end
+        if current then AZSRecorderJewelry.Request("bags", current.sequence); AZSRecorderEquipment.Request("bags", current.sequence) end
     elseif event == "PLAYER_LEAVING_WORLD" or event == "PLAYER_LOGOUT" then
         if current then Emit("capture_end", { reason = event }) end
         current, previousPhase = nil, nil
@@ -325,7 +326,7 @@ frame:SetScript("OnUpdate", function()
     end
     if current then ObservePlayerSpells(false) end
     if current then AZSRecorderTooltips.Update(Emit) end
-    if current then AZSRecorderJewelry.Update(Emit) end
+    if current then AZSRecorderJewelry.Update(Emit); AZSRecorderEquipment.Update(Emit) end
 end)
 
 SLASH_AZSRECORDER1 = "/azsrec"
