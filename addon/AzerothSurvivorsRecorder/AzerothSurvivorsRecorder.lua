@@ -1,5 +1,5 @@
 -- WoW 1.12 / Lua 5.0 conventions. This addon never changes gameplay or HUD settings.
-local VERSION = "0.1.10"
+local VERSION = "0.1.11"
 local MAX_RUNS, MAX_EVENTS = 8, 24000
 local frame = CreateFrame("Frame")
 local current, previousPhase, spellState, lastSample, pendingZone, awaitingRun
@@ -71,6 +71,133 @@ local function Emit(kind, data)
     end
     if kind == "jewelry" then current.jewelryCount = (current.jewelryCount or 0) + 1 end
     return current.sequence
+end
+
+-- Whole-run meter packets are cumulative counters, never individual hits.
+-- Keep only the latest bounded packet per stream between one-second writes.
+-- Latest JSON checkpoints survive the ordinary event/history limits and are
+-- optional run fields, so older importers can still read the original events.
+local meter = {}
+do
+    local streams, lastWrite
+    local MAX_PAYLOAD, MAX_HISTORY_BYTES, MAX_HISTORY = 16384, 524288, 4096
+    function meter.Reset()
+        streams, lastWrite = {}, nil
+    end
+    function meter.Receive(prefix, payload)
+        local channel = prefix == "AZSMETER" and "damage" or "healing"
+        local s = streams[channel]
+        if not s then s = { receipt = 0, clears = 0, oversized = 0 }; streams[channel] = s end
+        if payload == "" and s.nonempty then s.clears = s.clears + 1 end
+        if type(payload) == "string" then s.nonempty = payload ~= "" end
+        s.receipt = s.receipt + 1
+        s.status = type(payload) == "string" and string.len(payload) <= MAX_PAYLOAD
+            and "observed" or "oversized"
+        if s.status == "oversized" then s.oversized = s.oversized + 1 end
+        s.payload = s.status == "observed" and payload or nil
+        s.sessionTime, s.wallTime = GetTime(), time() * 1000
+        s.runTime = nil
+        if not awaitingRun then s.runTime = Clock() end
+        s.dirty = true
+    end
+    function meter.Update(force)
+        if not current then return end
+        local now = GetTime()
+        if not force and lastWrite and now - lastWrite < 1 then return end
+        lastWrite = now
+        for _, channel in ipairs({ "damage", "healing" }) do
+            local s = streams[channel]
+            if s and (s.dirty or (force and s.receipt ~= s.savedReceipt)) then
+                s.dirty = false
+                -- Ignore rate/share-only changes. This runs at most once/second,
+                -- not once per hit or transport packet. Raw tokens stay intact.
+                local signature = s.payload and string.gsub(s.payload,
+                    "([^,;]*),([^,;]*),[^,;]*,[^,;]*,([^,;]*)", "%1,%2,%3") or s.status
+                local changed = signature ~= s.signature or s.clears ~= s.savedClears
+                    or s.oversized ~= s.savedOversized
+                if changed or force then
+                    local data = { version = 1, channel = channel, status = s.status,
+                        payload = s.payload, receipt = s.receipt, clears = s.clears,
+                        oversizedReceipts = s.oversized,
+                        receivedSessionTime = s.sessionTime, receivedWallTime = s.wallTime,
+                        receivedRunTime = s.runTime }
+                    current.sequence = current.sequence + 1
+                    local record = { schemaVersion = 1, runId = current.id,
+                        seq = current.sequence, kind = "meter_snapshot", wallTime = time() * 1000,
+                        sessionTime = now, runTime = Clock(), data = data }
+                    local encoded = Json(record)
+                    -- Even pathological control characters cannot produce an
+                    -- unimportable checkpoint beyond the 64 KiB reader limit.
+                    if string.len(encoded) > 60000 then
+                        data.status, data.payload = "oversized", nil
+                        encoded = Json(record)
+                    end
+                    current[channel == "damage" and "meterDamage" or "meterHealing"] = encoded
+                    if changed then
+                        local bytes, count = current.meterBytes or 0, current.meterCount or 0
+                        if count < MAX_HISTORY and bytes + string.len(encoded) <= MAX_HISTORY_BYTES
+                            and table.getn(current.events) < MAX_EVENTS then
+                            table.insert(current.events, encoded)
+                            current.meterBytes, current.meterCount = bytes + string.len(encoded), count + 1
+                        else
+                            current.meterHistoryLimited = true
+                        end
+                    end
+                    s.signature, s.savedClears = signature, s.clears
+                    s.savedOversized, s.savedReceipt = s.oversized, s.receipt
+                end
+            end
+        end
+    end
+    meter.Reset()
+end
+
+-- Opt-in, two-minute callback diagnostic. No combat subscriptions by default.
+local probe = {}
+do
+    local active
+    local categories = { "CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE",
+        "CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE", "CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_DAMAGE",
+        "CHAT_MSG_SPELL_PERIODIC_SELF_BUFFS", "CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_BUFFS",
+        "CHAT_MSG_SPELL_SELF_BUFF", "CHAT_MSG_SPELL_SELF_DAMAGE", "CHAT_MSG_SPELL_PET_DAMAGE" }
+    function probe.Stop(reason)
+        if not active then return end
+        active.reason, active.ended = reason, GetTime()
+        if current then current.meterProbe = Json(active) end
+        for _, category in ipairs(categories) do frame:UnregisterEvent(category) end
+        active = nil
+    end
+    function probe.Start()
+        if not current then
+            DEFAULT_CHAT_FRAME:AddMessage("AZS Recorder: start a run before enabling the combat probe.")
+            return
+        end
+        probe.Stop("restarted")
+        active = { version = 1, started = GetTime(), categories = {} }
+        for _, category in ipairs(categories) do
+            active.categories[category] = { count = 0, samples = {}, omitted = 0 }
+            frame:RegisterEvent(category)
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("AZS Recorder: combat probe enabled for two minutes. Reload UI or exit normally afterwards to save its bounded samples.")
+    end
+    function probe.Receive(category, message)
+        if not active then return false end
+        if GetTime() - active.started >= 120 then probe.Stop("timeout"); return false end
+        local counter = active.categories[category]
+        if not counter then return false end
+        counter.count = counter.count + 1
+        if table.getn(counter.samples) < 2 then
+            if type(message) == "string" and string.len(message) <= 256 then
+                table.insert(counter.samples, message)
+            else
+                counter.omitted = counter.omitted + 1
+            end
+        end
+        return true
+    end
+    function probe.Update()
+        if active and GetTime() - active.started >= 120 then probe.Stop("timeout") end
+    end
 end
 
 -- Count observations are evidence of other players, not proof of lifetime solo mode.
@@ -278,6 +405,7 @@ local function StartRun()
     Emit("pets", { summons = AZS_PETS or {} })
     AZSRecorderJewelry.Request("baseline", current.sequence); AZSRecorderEquipment.Request("baseline", current.sequence)
     pendingZone = false
+    meter.Update(true)
 end
 
 local function Poll()
@@ -299,8 +427,11 @@ local function Poll()
         lastSample = clock
     end
     if phase == "ready" or phase == nil then
+        meter.Update(true)
+        probe.Stop("capture_end")
         Emit("capture_end", { reason = "left_world_or_ready" })
         current = nil
+        meter.Reset()
     end
 end
 
@@ -318,11 +449,22 @@ frame:RegisterEvent("PARTY_MEMBERS_CHANGED")
 frame:RegisterEvent("RAID_ROSTER_UPDATE")
 frame:SetScript("OnEvent", function()
     Init()
+    if probe.Receive(event, arg1) then return end
     if event == "CHAT_MSG_ADDON" then
         local prefix = arg1
         if prefix == "AZSZONE" then
+            meter.Update(true)
+            probe.Stop("new_zone")
             if current then Emit("capture_end", { reason = "new_zone" }) end
             current, previousPhase, pendingZone, awaitingRun = nil, nil, true, true
+            meter.Reset()
+            return
+        end
+        if prefix == "AZSMETER" or prefix == "AZSHEAL" then
+            local received = current or awaitingRun
+            if received then meter.Receive(prefix, arg2) end
+            Poll()
+            if current and not received then meter.Receive(prefix, arg2) end
             return
         end
         if prefix == "AZSRUN" then awaitingRun = false end
@@ -333,6 +475,7 @@ frame:SetScript("OnEvent", function()
         elseif prefix == "AZSPETS" then Emit("pets", { summons = AZS_PETS or {} })
         elseif prefix == "AZS" then Emit("stats", AZS_STATS or {})
         elseif prefix == "AZSEND" and AZS_END and AZS_END.result then
+            meter.Update(true)
             Emit("summary", AZS_END)
         elseif prefix == "AZSBANNER" and AZS_BANNER then Emit("banner", AZS_BANNER)
         elseif prefix == "AZSBOSSES" then Emit("bosses", AZS_SCHEDULE or {})
@@ -358,8 +501,11 @@ frame:SetScript("OnEvent", function()
     elseif event == "BAG_UPDATE" or event == "BAG_UPDATE_COOLDOWN" then
         if current then AZSRecorderJewelry.Request("bags", current.sequence); AZSRecorderEquipment.Request("bags", current.sequence) end
     elseif event == "PLAYER_LEAVING_WORLD" or event == "PLAYER_LOGOUT" then
+        meter.Update(true)
+        probe.Stop(event)
         if current then Emit("capture_end", { reason = event }) end
         current, previousPhase = nil, nil
+        meter.Reset()
     elseif event == "PLAYER_ENTERING_WORLD" then
         Poll()
     end
@@ -369,6 +515,8 @@ frame:SetScript("OnUpdate", function()
     if elapsed < 0.2 then return end
     elapsed = 0
     Poll()
+    meter.Update(false)
+    probe.Update()
     if current and (not lastPartySample or GetTime() - lastPartySample >= 1) then
         lastPartySample = GetTime()
         ObserveParty("poll", false)
@@ -379,8 +527,9 @@ frame:SetScript("OnUpdate", function()
 end)
 
 SLASH_AZSRECORDER1 = "/azsrec"
-SlashCmdList["AZSRECORDER"] = function()
+SlashCmdList["AZSRECORDER"] = function(command)
     Init()
+    if command == "probe" then probe.Start(); return end
     local recorded, tooltips, matched, jewelry = 0, 0, 0, 0
     for _, run in ipairs(AZSRecorderDB.runs) do
         recorded = recorded + table.getn(run.events or {})
