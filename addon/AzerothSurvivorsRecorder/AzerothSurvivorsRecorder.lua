@@ -1,5 +1,5 @@
 -- WoW 1.12 / Lua 5.0 conventions. This addon never changes gameplay or HUD settings.
-local VERSION = "0.1.11"
+local VERSION = "0.1.13"
 local MAX_RUNS, MAX_EVENTS = 8, 24000
 local frame = CreateFrame("Frame")
 local current, previousPhase, spellState, lastSample, pendingZone, awaitingRun
@@ -150,6 +150,261 @@ do
         end
     end
     meter.Reset()
+end
+
+-- Read the native outgoing feed independently of the HUD: no anchors, frame
+-- callbacks, combat subscriptions or per-frame polling. Names/keys are opaque.
+local combatText = {}
+do
+    local state
+    local MAX_BYTES, MAX_RETAINED_BYTES, MAX_READS, MAX_BATCH_BYTES = 8388608, 33554432, 4, 40000
+    local kinds = { player = true, pet = true, summon = true, totem = true, ownedUnknown = true }
+    local fields = { "eventId", "presentedAt", "kind", "amount", "sourceKind", "sourceId",
+        "targetId", "targetName", "abilityName", "spellId", "critical", "periodic", "reflected",
+        "damageType", "schoolMask", "meterSource", "meterSourceKey" }
+    local strings = { "sourceId", "targetId", "targetName", "abilityName", "meterSource", "meterSourceKey" }
+    local function Number(n) return type(n) == "number" and n - n == 0 and n >= 0 and n <= 9007199254740991 end
+    local function Id(s) return type(s) == "string" and string.len(s) > 0 and string.len(s) <= 512 end
+    local function Observe(value)
+        local result = { resultType = type(value) }
+        if type(value) ~= "table" then return result end
+        for _, key in ipairs({ "apiVersion", "maxEventsPerRead", "streamId", "worldId", "clockSeconds",
+            "cursor", "events", "hasMore", "droppedCount", "eventId", "presentedAt", "kind", "amount",
+            "sourceKind", "critical", "periodic", "reflected", "spellId", "damageType", "schoolMask" }) do
+            local v = value[key]
+            result[key .. "Type"] = type(v)
+            if type(v) == "boolean" or (type(v) == "number" and v - v == 0) then result[key] = v
+            elseif type(v) == "string" then
+                if string.len(v) <= 128 then result[key] = v else result[key .. "Bytes"] = string.len(v) end
+            end
+        end
+        if type(value.events) == "table" then result.eventCount = table.getn(value.events) end
+        return result
+    end
+    local function Diagnose(status, stage, reason, value, code, message)
+        if not current or not state then return end
+        local d = current.combatTextDiagnostic
+        if not d then
+            d = { version = 1, startedSessionTime = state.began }
+            current.combatTextDiagnostic = d
+        end
+        d.status, d.stage, d.reason = status, stage, reason
+        d.attempts, d.updatedSessionTime = state.attempts, GetTime()
+        d.functions = { capabilities = type(AZS_GetCombatTextCapabilities), events = type(AZS_GetCombatTextEvents),
+            nativeEvents = type(AZS_NativeCombatTextEvents), globalTable = type(_G),
+            globalCapabilities = type(type(_G) == "table" and _G.AZS_GetCombatTextCapabilities or nil),
+            globalEvents = type(type(_G) == "table" and _G.AZS_GetCombatTextEvents or nil) }
+        d.observed = Observe(value)
+        d.errorCode = type(code) == "string" and string.len(code) <= 128 and code or nil
+        d.errorMessage, d.errorBytes = nil, nil
+        if type(message) == "string" then
+            d.errorBytes = string.len(message)
+            -- Keep UTF-8 intact. Oversized messages are omitted, not sliced.
+            d.errorMessage = string.len(message) <= 512 and message or "Native API error exceeded 512 bytes."
+        end
+    end
+    local function Stop(reason, detail, value)
+        if current and current.combatText then current.combatText.reason = reason end
+        Diagnose("failed", state and state.cursor and "events" or "baseline", detail or reason, value)
+        if current and current.combatTextDiagnostic then current.combatTextDiagnostic.stoppedBecause = "permanent-error" end
+        if state then state.stopped = true end
+    end
+    local function Call(callback, cursor, limit)
+        local ok, result, failure
+        if cursor == nil and limit == nil then ok, result, failure = pcall(callback)
+        else ok, result, failure = pcall(callback, cursor, limit) end
+        if not ok then return nil, "lua_error", nil, result end
+        if failure ~= nil then
+            return nil, "api_error", type(failure) == "table" and failure.code or nil,
+                type(failure) == "table" and failure.message or (type(failure) == "string" and failure
+                    or "Unexpected API error return type: " .. type(failure))
+        end
+        if type(result) ~= "table" then return nil, "invalid_result", nil, "Expected a table response" end
+        return result
+    end
+    local function StartupFailure(stage, reason, value, code, message)
+        local retry = reason == "missing_api" or code == "NOT_READY" or code == "NOT_IN_WORLD"
+        Diagnose(retry and "waiting" or "failed", stage, reason, value, code, message)
+        if retry then
+            state.retryAt = GetTime() + math.min(4, 0.5 * 2 ^ (state.attempts - 1))
+        else
+            state.stopped = true
+            current.combatTextDiagnostic.stoppedBecause = "permanent-error"
+        end
+    end
+    local function Event(value, clock)
+        if type(value) ~= "table" or not Id(value.eventId) or not Number(value.presentedAt)
+            or value.presentedAt > clock or not kinds[value.sourceKind]
+            or type(value.critical) ~= "boolean" or type(value.periodic) ~= "boolean"
+            or type(value.reflected) ~= "boolean" then return end
+        if value.kind == "damage" then
+            if not Number(value.amount) or value.result ~= nil then return end
+        elseif value.kind ~= "miss" or type(value.result) ~= "table"
+            or not Id(value.result.key) or (value.result.text ~= nil and not Id(value.result.text))
+            or value.amount ~= nil then return end
+        for _, key in ipairs(strings) do if value[key] ~= nil and not Id(value[key]) then return end end
+        if value.spellId ~= nil and (not Number(value.spellId) or value.spellId < 1
+            or value.spellId > 4294967295 or math.floor(value.spellId) ~= value.spellId) then return end
+        if value.schoolMask ~= nil and (not Number(value.schoolMask) or value.schoolMask < 1
+            or value.schoolMask > 127 or math.floor(value.schoolMask) ~= value.schoolMask) then return end
+        if value.damageType ~= nil and value.damageType ~= "melee" and value.damageType ~= "ranged"
+            and value.damageType ~= "spell" then return end
+        local copy = {}
+        for _, key in ipairs(fields) do copy[key] = value[key] end
+        if value.result then copy.result = { key = value.result.key, text = value.result.text } end
+        return copy
+    end
+    function combatText.Start()
+        state = { began = GetTime(), attempts = 0, seen = {}, order = {}, slot = 0 }
+        Diagnose("waiting", "availability", "starting")
+        combatText.Update(false)
+    end
+    function combatText.Update(force)
+        if not current or not state or state.stopped then return end
+        local now = GetTime()
+        if not state.cursor and (now - state.began >= 30 or state.attempts >= 12) then
+            local d = current.combatTextDiagnostic
+            d.status, d.stoppedBecause, d.updatedSessionTime = "failed", "deadline", now
+            state.stopped = true
+            return
+        end
+        if state.retryAt and now < state.retryAt then return end
+        if not state.cursor then
+            state.attempts = state.attempts + 1
+            if type(AZS_GetCombatTextCapabilities) ~= "function" or type(AZS_GetCombatTextEvents) ~= "function" then
+                StartupFailure("availability", "missing_api"); return
+            end
+            if not state.limit then
+                local caps, reason, code, message = Call(AZS_GetCombatTextCapabilities)
+                if not caps then StartupFailure("capabilities", reason, caps, code, message); return end
+                if caps.apiVersion ~= 1 or not Number(caps.maxEventsPerRead) or caps.maxEventsPerRead < 1
+                    or math.floor(caps.maxEventsPerRead) ~= caps.maxEventsPerRead then
+                    StartupFailure("capabilities", "invalid_capabilities", caps); return
+                end
+                state.limit = math.min(256, caps.maxEventsPerRead)
+            end
+        end
+        for read = 1, MAX_READS do
+            local result, reason, code, message = Call(AZS_GetCombatTextEvents, state.cursor, state.limit)
+            if not result then
+                if not state.cursor then StartupFailure("baseline", reason, result, code, message)
+                else
+                    Stop("feed_error")
+                    Diagnose("failed", "events", reason, result, code, message)
+                    current.combatTextDiagnostic.stoppedBecause = "permanent-error"
+                end
+                return
+            end
+            state.retryAt = nil
+            if result.apiVersion ~= 1 or not Id(result.streamId) or not Id(result.worldId)
+                or not Number(result.clockSeconds) or not Id(result.cursor)
+                or type(result.hasMore) ~= "boolean" or not Number(result.droppedCount)
+                or math.floor(result.droppedCount) ~= result.droppedCount or type(result.events) ~= "table"
+                or (state.clock and result.clockSeconds < state.clock) then Stop("invalid_feed", "invalid_header", result); return end
+            if state.stream and (state.stream ~= result.streamId or state.world ~= result.worldId) then
+                Stop("world_changed"); return
+            end
+            local count = table.getn(result.events)
+            local keys = 0
+            for key in pairs(result.events) do
+                if type(key) ~= "number" or key < 1 or math.floor(key) ~= key or key > count then Stop("invalid_feed", "invalid_array", result); return end
+                keys = keys + 1
+            end
+            if keys ~= count or count > state.limit
+                or (not state.cursor and (count > 0 or result.hasMore or result.droppedCount > 0))
+                or (state.cursor == result.cursor and (count > 0 or result.hasMore or result.droppedCount > 0)) then
+                Stop("invalid_feed", "invalid_cursor_or_array", result); return
+            end
+            local page, previous = {}, state.presentedAt
+            for index = 1, count do
+                local value = Event(result.events[index], result.clockSeconds)
+                if not value or (previous and value.presentedAt < previous) then Stop("invalid_feed", "invalid_event", result.events[index]); return end
+                previous = value.presentedAt
+                page[index] = value
+            end
+            if not current.combatText then
+                Diagnose("selected", "baseline", nil, result)
+                current.combatText = { version = 1, selected = true, startedSessionTime = now,
+                    lateStart = now - state.began > 0.5 or (Clock() or 0) > 0.5,
+                    streamId = result.streamId, worldId = result.worldId,
+                    bytes = 0, batches = 0, events = 0, dropped = 0, duplicates = 0,
+                    missingAttribution = 0, ended = false }
+            end
+            local status = current.combatText
+            status.dropped = status.dropped + result.droppedCount
+            local batch, size = {}, 0
+            local function Flush()
+                if table.getn(batch) == 0 then return true end
+                local data = { version = 1, streamId = result.streamId, worldId = result.worldId,
+                    clockSeconds = result.clockSeconds, events = batch }
+                -- Reserve envelope bytes before encoding; the shared event limit
+                -- still protects metadata and marks the whole segment truncated.
+                if status.bytes + size + 8192 > MAX_BYTES or table.getn(current.events) >= MAX_EVENTS then
+                    Stop("storage_limit"); return false
+                end
+                local retained = 0
+                for _, run in ipairs(AZSRecorderDB.runs) do
+                    retained = retained + (run.combatText and run.combatText.bytes or 0)
+                end
+                while retained + size + 8192 > MAX_RETAINED_BYTES and table.getn(AZSRecorderDB.runs) > 1 do
+                    local old = table.remove(AZSRecorderDB.runs, 1)
+                    retained = retained - (old.combatText and old.combatText.bytes or 0)
+                end
+                if not Emit("combat_text", data) then Stop("storage_limit"); return false end
+                status.bytes = status.bytes + string.len(current.events[table.getn(current.events)])
+                status.batches, status.events = status.batches + 1, status.events + table.getn(batch)
+                batch, size = {}, 0
+                return true
+            end
+            for _, value in ipairs(page) do
+                if state.seen[value.eventId] then status.duplicates = status.duplicates + 1
+                elseif value.presentedAt < status.startedSessionTime then
+                    Stop("invalid_feed"); return
+                else
+                    local bytes = string.len(Json(value))
+                    if size + bytes > MAX_BATCH_BYTES and not Flush() then return end
+                    table.insert(batch, value); size = size + bytes + 1
+                    if not value.meterSource or not value.meterSourceKey then
+                        status.missingAttribution = status.missingAttribution + 1
+                    end
+                    state.slot = math.mod(state.slot, 4096) + 1
+                    local old = state.order[state.slot]
+                    if old then state.seen[old] = nil end
+                    state.order[state.slot], state.seen[value.eventId] = value.eventId, true
+                end
+            end
+            if not Flush() then return end
+            state.cursor, state.stream, state.world = result.cursor, result.streamId, result.worldId
+            state.clock, state.presentedAt = result.clockSeconds, previous
+            state.hasMore = result.hasMore
+            if not result.hasMore then return end
+        end
+    end
+    function combatText.End()
+        combatText.Update(true)
+        if current and current.combatText then
+            if state.hasMore and not state.stopped then Stop("backlog_at_end") end
+            current.combatText.ended = true
+        elseif current and current.combatTextDiagnostic and current.combatTextDiagnostic.status == "waiting" then
+            current.combatTextDiagnostic.status = "failed"
+            current.combatTextDiagnostic.stoppedBecause = "capture-end"
+            current.combatTextDiagnostic.updatedSessionTime = GetTime()
+        end
+        state = nil
+    end
+    function combatText.Report()
+        local run = current or AZSRecorderDB.runs[table.getn(AZSRecorderDB.runs)]
+        local d = run and run.combatTextDiagnostic
+        if not d then
+            DEFAULT_CHAT_FRAME:AddMessage("Native capture: no startup diagnostic saved. Start a run with recorder " .. VERSION .. ".")
+            return
+        end
+        DEFAULT_CHAT_FRAME:AddMessage("Native capture: " .. d.status .. ", stage " .. d.stage .. ", attempts " .. d.attempts
+            .. (d.reason and ", " .. d.reason or "") .. (d.errorCode and " (" .. d.errorCode .. ")" or ""))
+        if d.errorMessage then DEFAULT_CHAT_FRAME:AddMessage(d.errorMessage) end
+        DEFAULT_CHAT_FRAME:AddMessage("Native APIs: capabilities=" .. d.functions.capabilities .. ", events=" .. d.functions.events
+            .. ", native events=" .. d.functions.nativeEvents)
+    end
 end
 
 -- Opt-in, two-minute callback diagnostic. No combat subscriptions by default.
@@ -406,6 +661,7 @@ local function StartRun()
     AZSRecorderJewelry.Request("baseline", current.sequence); AZSRecorderEquipment.Request("baseline", current.sequence)
     pendingZone = false
     meter.Update(true)
+    combatText.Start()
 end
 
 local function Poll()
@@ -427,6 +683,7 @@ local function Poll()
         lastSample = clock
     end
     if phase == "ready" or phase == nil then
+        combatText.End()
         meter.Update(true)
         probe.Stop("capture_end")
         Emit("capture_end", { reason = "left_world_or_ready" })
@@ -453,6 +710,7 @@ frame:SetScript("OnEvent", function()
     if event == "CHAT_MSG_ADDON" then
         local prefix = arg1
         if prefix == "AZSZONE" then
+            combatText.End()
             meter.Update(true)
             probe.Stop("new_zone")
             if current then Emit("capture_end", { reason = "new_zone" }) end
@@ -475,6 +733,7 @@ frame:SetScript("OnEvent", function()
         elseif prefix == "AZSPETS" then Emit("pets", { summons = AZS_PETS or {} })
         elseif prefix == "AZS" then Emit("stats", AZS_STATS or {})
         elseif prefix == "AZSEND" and AZS_END and AZS_END.result then
+            combatText.Update(true)
             meter.Update(true)
             Emit("summary", AZS_END)
         elseif prefix == "AZSBANNER" and AZS_BANNER then Emit("banner", AZS_BANNER)
@@ -501,6 +760,7 @@ frame:SetScript("OnEvent", function()
     elseif event == "BAG_UPDATE" or event == "BAG_UPDATE_COOLDOWN" then
         if current then AZSRecorderJewelry.Request("bags", current.sequence); AZSRecorderEquipment.Request("bags", current.sequence) end
     elseif event == "PLAYER_LEAVING_WORLD" or event == "PLAYER_LOGOUT" then
+        combatText.End()
         meter.Update(true)
         probe.Stop(event)
         if current then Emit("capture_end", { reason = event }) end
@@ -515,6 +775,7 @@ frame:SetScript("OnUpdate", function()
     if elapsed < 0.2 then return end
     elapsed = 0
     Poll()
+    combatText.Update(false)
     meter.Update(false)
     probe.Update()
     if current and (not lastPartySample or GetTime() - lastPartySample >= 1) then
@@ -530,6 +791,7 @@ SLASH_AZSRECORDER1 = "/azsrec"
 SlashCmdList["AZSRECORDER"] = function(command)
     Init()
     if command == "probe" then probe.Start(); return end
+    if command == "native" then combatText.Report(); return end
     local recorded, tooltips, matched, jewelry = 0, 0, 0, 0
     for _, run in ipairs(AZSRecorderDB.runs) do
         recorded = recorded + table.getn(run.events or {})
