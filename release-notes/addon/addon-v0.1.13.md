@@ -1,10 +1,7 @@
-Fixed native damage capture failing to start even when the game provided it.
-The recorder also waits longer for damage tracking to become ready when entering
-a run. If tracking cannot start, it saves the failure details so the problem can
-be diagnosed instead of silently using only the combat log.
+The recorder can now capture individual outgoing hits on game versions that provide combat-text events. Reports can credit procs, pets and summons to the source shown in the game's damage meter, even when the floating spell name differs.
 
-Use `/azsrec native` to see the current or most recently recorded native capture
-status. Startup checks use bounded retries and stop after thirty seconds.
+Native damage capture now starts correctly when the game provides it, with bounded retries while entering a run. Use `/azsrec native` to see the current or most recent capture status.
 
-Reload the UI or restart the game after installing. Reload the UI or exit
-normally after a run to save its recording.
+Reports warn when capture starts late, the game drops events or recording reaches a limit. Older game versions continue to use combat logs. Healing capture is unchanged. Existing recordings cannot gain source information that was never captured.
+
+Reload the UI or restart the game after installing. Reload the UI or exit normally after a run to save its recording.
